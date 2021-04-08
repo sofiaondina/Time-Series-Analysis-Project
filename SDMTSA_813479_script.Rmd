@@ -1,0 +1,1084 @@
+---
+title: "Time series analysis project"
+author: "Sofia Davoli"
+date: "3/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE)
+library("tidyverse")
+library("xts")
+library("forecast")
+library("KFAS")
+library("lubridate")
+library("caret")
+library("astsa")
+library("urca")
+library("tsfknn")
+library("ModelMetrics")
+library('tensorflow')
+library("keras")
+library("DMwR")
+library("ggpubr")
+
+
+load("C:/Users/davol/Documents/Magistrale/time series/consegna/SDMSTA_813479_obj.RData")
+#load("C:\\Users\\davol\\Documents\\Magistrale\\time #series\\PROJECT\\object\\obj_sdmtsa.RData")
+#load("C:\\Users\\davol\\Documents\\Magistrale\\time #series\\PROJECT\\obj_UCM.RData")
+#load("C:\\Users\\davol\\Documents\\Magistrale\\time #series\\PROJECT\\obj_KNN.RData")
+
+ts <- read_csv2("C:\\Users\\davol\\Documents\\Magistrale\\time series\\PROJECT\\TrainingSet.csv")
+ts <- ts %>%
+  rename(Data = DATA,
+        Valore = VALORE)
+```
+
+## Data Preprocessing and Exploration
+
+Data preprocessing consist in fixing 2 missing value in this time series (TS). Missing values are on 29-03-2020 and 31-03-2019 which represents Italian daylight savings time (ora legale). Missing imputation has been applied by substituting the value with the one of the previous hour, considering that values at 3am seems to be quite constant.
+
+For further exploration, weekly TS has been created by setting frequency parameter to 168 (24 hours* 7 days).
+
+Finally TS has been scaled to optimize models training.
+
+
+```{r data preprocessing, results='hide'}
+
+#head(ts)
+
+#-- Explorative Analysis
+sapply(ts, function(x)(sum(is.na(x)))) #-- find NA
+
+ts %>%
+  group_by(Ora) %>% #-- Group by Ora
+  summarise(n()) #-- find NA (problem with 3 A.M.)
+
+ts %>%
+  group_by(month(date(Data)),
+           day(date(Data))) %>%
+  summarise(n()) %>%
+  filter(`n()` == 47) #-- find days with legal hours
+
+#-- problem with ora legale: 31-03-2019 and 29-03-2020
+#-- add in the ts
+ts_legale <- tribble(
+  ~Data, ~Ora, ~Valore,
+  "2019-03-31", 3, 3039997,
+  "2020-03-29", 3, 2329514
+) %>%
+  mutate(Data = as.Date(Data))
+
+#-- Weekly Time series
+ts_weekly <- ts %>%
+  bind_rows(ts_legale) %>% #-- Concatenazione
+  arrange(Data) %>% #-- Ordinamento
+  ts(frequency = 168) #-- Frequenza Settimanale (24 h * 7 g)
+
+#-- Daily Time series
+ts_daily <- ts %>%
+  bind_rows(ts_legale) %>%
+  arrange(Data) %>%
+  ts(frequency = 24) #-- 24*7
+
+#-- Time Series
+ts <- ts %>%
+  bind_rows(ts_legale) %>%
+  arrange(Data)
+
+#-- identify min max values
+max_value <- which.max(ts$Valore)
+min_value <- which.min(ts$Valore)
+
+#-- Mean Aggregaton for Seasonal Plot
+ag <- aggregate(Valore ~ Data, ts, mean)
+
+#-- scaling TS to optimize models training
+ts_stand <- ts(scale(ts$Valore), frequency = 24)
+```
+
+Daily plot (1) shows a clear daily seasonality but from Weekly plot (2) no particular weekly trend appears, in fact there are no significant differences in values from 1st day of the week from the last day. We can assume that weekend days have no significant influence  on TS. 
+Daily seasonality is confirmed by plot 6 (automatic TS decomposition) in which appear a seasonal24 decomposition. 
+
+
+```{r daily and weekly seasonality , echo = FALSE, warning=FALSE, cache = TRUE}
+#-- daily Plot
+ggseasonplot(ts_daily[,"Valore"],
+             year.labels=TRUE,
+             year.labels.left=FALSE,
+             ylab = "Value (in millions)",
+             xlab = "Day Hours",
+             main = "1. Daily plot") +
+  theme_bw() +
+  theme(axis.text.y = element_text(face = "bold"),
+        axis.text.x = element_text(face = "bold",
+                                   angle = 45)) + 
+  scale_y_continuous(breaks = c(2000000,
+                                4000000,
+                                6000000,
+                                8000000),
+                     labels = c(2,4,6,8)) +
+  scale_x_continuous(breaks = c(2, 4, 6),
+                     label = c(2,3,4))+theme_gray()
+#-- weekly Plot
+ggseasonplot(ts_weekly[,"Valore"], year.labels=TRUE, 
+             year.labels.left=TRUE, 
+             ylab = "Value (in millions)",
+             xlab = "Day of the week",
+             main = "2. Weekly plot")+theme_gray()
+
+```
+
+Monthly plot clearly shows no monthly seasonality.
+Finally a clear yearly seasonality appear in plot 4 (even if only 2 year are available). In this plot line 2 is always below line 1 because of Covid effect, this effect can easily be seen from total time series plot (5) where the second half of the plot decrease compared from first half (red line indicate the trend and it decrease from one year to the other).
+
+
+
+
+```{r monthly and yearly seasonality , echo = FALSE, cache = TRUE}
+#-- monthly Plot
+ggseasonplot(ts(ag[,"Valore"], frequency = 30), year.labels=TRUE,                year.labels.left=TRUE,
+             ylab = "Value (in millions)",
+             xlab = "days of the month",
+             main = "3. Monthly plot")+theme_gray()
+#-- yearly Plot
+ggseasonplot(ts(ag[,"Valore"], frequency = 730/2),       year.labels=FALSE, year.labels.left=FALSE, labelgap = 50,
+             ylab = "Value (in millions)",
+             xlab = "Months", 
+             main = "4. Yearly plot")+theme_gray()
+#-- ts plot
+ts %>%
+  ggplot(aes(x=Data, y=Valore)) +
+      ggtitle("5. TS plot") +
+      xlab("time") + 
+      ylab("Value (in millions)")+
+      geom_line() +
+  stat_smooth(method = "gam", se = T, col="blue", level=0.99) +
+  stat_smooth(method = "lm", se = T, col="red", level=0.99)+theme_gray()
+
+#-- scomposizione serie storica
+autoplot(mstl(ts(ts$Valore, frequency = 24)), main='6. Decomposition of TS')+theme_gray()
+
+```
+
+
+
+
+## Arima and Naive methods
+
+Training and validation set for arima models are created respectively using  80% - 20% of data. 
+Models are trined and evaluated on scaled data. 
+
+```{r training-validation arima, echo = TRUE, results='hide', cache = TRUE}
+train_arima <- ts(ts_stand[1:as.integer(nrow(ts)*0.8), ],
+                  frequency = 24)
+validation_arima <- ts(ts_stand[(1 + as.integer(nrow(ts)*0.8)) :                      nrow(ts), ], frequency = 24)
+
+```
+
+Some preliminary assumptions are made based on ACF and PACF results.
+
+ACF plot shows a clear seasonality of period 24, in fact 
+the autocorrelations is higher for the seasonal lags (at multiples of 24) than for other lags.
+PACF plot suggest an AR(2),AR(3) or AR(5) model since the number of non-zero partial autocorrelations (in this case 5) gives the order of the AR model.
+
+
+```{r acf and pacf plot}
+#--- Acf Pacf 
+ggarrange(ggAcf(ts_stand,
+      lag.max = 48, #-- 2 Days for Seasonality
+      main = "ACF"),
+          ggPacf(ts_stand,
+       lag.max = 48, #-- 2 Days for Seasonality
+       main = "PACF"),
+          nrow = 2, ncol= 1)+theme_gray()
+
+
+```
+
+
+To identify the best model Box-jenkins methodology is applied.
+
+1 - BoxCox optimal transformation suggest as optimum lambda 0.9284836 which is very close to 1, meaning that no other trasformation is needed to stabilize variance.
+
+2 - As previously seen, the TS show a strong seasonality component. To remove it, a seasonal differences at lag 24 is taken. A Box-Ljung test reject H0 of White Noise. 
+
+3 - 2 more differences has to be taken to get to a White noise process. In first differences ACF and PACF show a wery high first lag, suggesting that another differences has to be taken. ACF plot of second differences suggest a White noise process confirmed by Box-Ljung test
+
+This results suggest the use of a SARIMA model with daily seasonality, 2 integration and AR component equal to 2, 3 or 5.
+
+```{r Box-jenkins methodology, echo = FALSE, cache = TRUE }
+#check variance
+lambda <- BoxCox.lambda(train_arima)
+#lambda
+
+#tseasonal differences
+train_diff_seasonal<-diff(train_arima, lag=24)
+autoplot(train_diff_seasonal, main='seasonal difference')+theme_gray()
+Box.test(train_diff_seasonal, type='Ljung-Box') #H0 rejected
+
+#first differences
+train_diff_trend<-diff(train_diff_seasonal, differences = 1)
+autoplot(train_diff_trend, main='first differences')+theme_gray()#c'e ancora stagionalità giornaliera
+ggarrange(ggAcf(train_diff_trend, 
+                lag.max = 72, main = "ACF"),
+          ggPacf(train_diff_trend, 
+                 lag.max = 72, main = "PACF"),
+          nrow = 2, ncol= 1)+theme_gray()
+
+
+
+Box.test(train_diff_trend, type='Ljung-Box') #H0 rejected
+
+#second differences
+train_diff_trend2<-diff(train_diff_trend, differences = 1)
+autoplot(train_diff_trend2, main='second difference')+theme_gray()
+ggAcf(train_diff_trend2, lag.max = 72, main = "ACF after 1 seasonal difference and 2 difference")+theme_gray()
+Box.test(train_diff_trend2, type='Ljung-Box') #H0 accepted
+
+```
+
+
+A naive model is trained. Comparing plot 7 (showing predicted values of naive model) with the real TS plot is clear that this model doesn't show any yearly seasonality component. ACF and PACF of residuals are not white noises typical.  Mae of naive model on validation data is 0.6563888. 
+
+```{r naive model, echo = FALSE, cache = TRUE}
+naive <- naive(train_arima, h = 3504)
+autoplot(naive, xlab = "Time", ylab = "Value",  main = "7. Naive model prediction" ) 
+naive_res<-naive$residuals
+
+ggarrange(ggAcf(naive_res,
+                lag.max = 96,       
+                main = ""),
+          ggPacf(naive_res,
+                 lag.max = 96,       #-- 2 Days for Seasonality
+                 main = ""),
+          labels = c("ACF naive", "PACF naive"),
+          nrow = 2, ncol= 1)+theme_gray()
+
+Box.test(naive_res, type='Ljung-Box') #H0 rejected
+
+naive_mean <- ts(naive$mean, start = 1, frequency = 24)
+mae_naiff <- mean(abs(validation_arima - naive_mean))
+#mae_naiff
+
+```
+
+First Arima trained has AR(2),I(1) and MA(1). 
+
+Residual analysis suggest to reject H0 of white noise. Moreover in Acf plot a strong seasonal component is present (increase MA order) and an increase in AR part of the model is suggested from PACF.
+Mae of ARIMA(2,1,1) on validation data is 0.5436. 
+
+```{r arima(2,0,0)(0,1,1), cache=TRUE}
+mod1_arima <- Arima(train_arima, c(2,0,0), c(0,1,1), lambda = "auto",
+              include.constant = TRUE)
+smod1_arima <- summary(mod1_arima)
+#smod1_arima[,"MAE"]
+
+checkresiduals(mod1_arima)
+ggPacf(mod1_arima$residuals, lag.max = 96, main = "PACF")+theme_gray()
+#Box.test(mod1_arima$residuals, type='Ljung-Box') #H0 rejected
+#-- previsioni
+pred_val1 <- forecast(mod1_arima, h = 3504)
+
+mae_mod1_arima <- mean(abs(ts(pred_val1$mean, start = 1, frequency = 24) - validation_arima))
+#mae_mod1_arima
+
+
+```
+
+Arima (3,1,2) is trained. 
+
+Residual analysis suggest to accept H0 of white noise, it looks like this model is a good model. Moreover Acf and Pacf are typical of white noises. 
+Prediction in plot 8 are not as good as expected, in particuar the last part of prediction sottoestimate the real TS values and it looks like the arima model perceive a decreasing trend, surely caused by Covid effect. Arima are not very good for long time predictions. 
+Mae of ARIMA(3,1,2) on validation data is 0.5206016. 
+
+
+```{r arima(3,0,0)(0,1,2), cache=TRUE}
+
+mod2_arima <- Arima(train_arima, c(3,0,0),                    seasonal=list(order=c(0,1,1),period=24),
+                    lambda = "auto",
+                    include.constant = TRUE)
+smod2_arima <- summary(mod2_arima)
+#smod2_arima[,"MAE"]
+
+ggarrange(ggAcf(mod2_arima$residuals,
+                lag.max = 96,       
+                main = ""),
+          ggPacf(mod2_arima$residuals,
+                 lag.max = 96,       #-- 2 Days for Seasonality
+                 main = ""),
+          labels = c("ACF arima(3,0,0)(0,1,2)", "PACF arima(3,0,0)(0,1,2)"),
+          nrow = 2, ncol= 1)
+#checkresiduals(mod2_arima)
+Box.test(mod2_arima$residuals, type='Ljung-Box') #H0 rejected
+
+#-- previsioni
+pred_val2 <- forecast(mod2_arima, h = 3504)
+
+valid <- ts(ts_stand[(1 + as.integer(nrow(ts)*0.8)) : nrow(ts), ]
+            , frequency = 24, start=583) #per plot
+
+autoplot(train_arima, main='8. Arima (3,1,2)  prevision')+autolayer(valid)+autolayer(pred_val2$mean)+theme_gray()
+
+mae_mod2_arima <- mean(abs(ts(pred_val2$mean, start = 1, frequency = 24) - validation_arima))
+#mae_mod2_arima
+
+```
+
+Auto Arima model is trained.
+
+Residual analysis suggest to accept H0 of white noise, it looks like this model is a good model. Moreover Acf and Pacf are typical of white noises.
+Also this model sottoestimate the second half of validation data. 
+Mae of Auto Arima on validation data is 0.496358, 0.03 less than the previous simplest model. 
+Arima are not very good for long time predictions, in fact R. Hyndman explain that auto.arima function and arima model in general are designed for short forecasting period. He sugggest to use a Fourier series approach where the seasonal pattern is modelled using Fourier terms with short-term time series dynamics allowed in the error.
+
+REF: https://robjhyndman.com/hyndsight/longseasonality/
+
+
+```{r ARIMA(5,0,2)(2,1,0)[24], cache=TRUE}
+automod_arima <- auto.arima(train_arima, lambda = "auto")
+sautomod_arima <- summary(automod_arima)
+#sautomod_arima[, "MAE"]
+
+checkresiduals(automod_arima)
+#Box.test(automod_arima$residuals, type='Ljung-Box') #H0 accepted
+ggarrange(ggAcf(automod_arima$residuals,
+                lag.max = 96,       
+                main = ""),
+          ggPacf(automod_arima$residuals,
+                 lag.max = 96,       #-- 2 Days for Seasonality
+                 main = ""),
+          labels = c("ACF auto.arima", "PACF auto.arima"),
+          nrow = 2, ncol= 1)
+
+
+pred_val_auto <- forecast(automod_arima, h = 3504)
+
+mae_automod_arima <- mean(abs(ts(pred_val_auto$mean, start = 1, frequency = 24) - validation_arima))
+#mae_automod_arima
+
+
+autoplot(train_arima, main='9. Auto Arima model fitting and prevision')+autolayer(pred_val_auto$fitted)+autolayer(valid)+autolayer(pred_val_auto$mean)
+
+
+```
+
+Arimax models are trained. 
+
+Function mtst is used to create a multiseasonal (daily and yearly) time series objects. Moreover 2 fourier regressor are taken to handle the daily seasonality and 2 regressor for yearly seasonality.
+Both arima(3,1,2) and auto.arima model are trained using fourier regressors.
+Best results are obtained using auto arimax with a MAE of 0.4367472.
+From residuals analysis White noise assumption is accepted.
+
+```{r ARIMAX, cache=TRUE}
+y<-msts(train_arima, c(24, 365*24)) # multiseasonal ts
+
+#-- arimax
+arimax_1 <- Arima(y, c(3,1,2), xreg=fourier(y, K=c(2,2)))
+
+#-- previsioni e mae
+pred_arimax_1 <- forecast(arimax_1, xreg= fourier(y, K=c(2,2), 3504), 3504)
+plot(pred_arimax_1, main='10. Arimax(3,1,2) prevision' )
+
+mae_arimax1 <- mean(abs(ts(pred_arimax_1$mean, start = 1, frequency = 24) - validation_arima))
+#mae_arimax1
+
+checkresiduals(arimax_1)
+
+#-- auto arimax
+arimax_2 <- auto.arima(y, seasonal=F, xreg=fourier(y, K=c(2,2)))
+
+
+#-- previsioni e mae
+pred_arimax_2 <- forecast(arimax_2, xreg= fourier(y, K=c(2,2), 3504), 3504)
+plot(pred_arimax_2, main='11. Auto Arimax prevision' )
+
+
+mae_arimax_2 <- mean(abs(ts(pred_arimax_2$mean, start = 1, frequency = 24) - validation_arima))
+#mae_arimax_2 
+
+checkresiduals(arimax_2)
+
+```
+
+Arima (3,1,2) with fourier regressor is chosen as best model because:
+
+ 1 residuals are white noises
+ 2 increase of 2 in the AR part only generate 0.01 of decreasing in MAE, so a simplest model is preferred.
+
+
+```{r test prevision  with best ARIMA}
+
+ts_best<-msts(ts_stand, c(24, 365*24))
+best_arima <- Arima(ts_best,
+                         c(3,1,2),
+                         xreg=fourier(ts_best, K=c(2,2)),
+                    include.constant = TRUE,
+                    lambda = 'auto')
+                    
+sbest_arima <- summary(best_arima)
+#sbest_arima[,"MAE"]
+
+pred_best_arima <- forecast(best_arima, xreg= fourier(ts_best, K=c(2,2), 1464), 1464)
+autoplot(pred_best_arima, main='12. Test prevision best arimax', ylab='standardized TS')
+
+
+
+```
+
+## UCM 
+
+Training and validation set for ucm models are created respectively using  80% - 20% of data. 
+Models are trined and evaluated on scaled data. 
+Variance of training set is extracted to initialize optimization parameters.
+
+```{r training-validation UCM,  echo = TRUE}
+train_ucm <- ts(ts_stand[1:as.integer(nrow(ts_stand)*0.8), ],
+                frequency = 24,
+                start = 1)
+
+validation_ucm <- ts(ts_stand[(1 + as.integer(nrow(ts_stand)*0.8)) : nrow(ts_stand), ],
+                     frequency = 24,
+                     start = 585)
+
+v_train_ucm <- var(train_ucm) 
+```
+
+Firs UCM trained is a simple Local Linear Trend, MAE obtained is 0.6857667. Plot 13 show prevision made with this model. 
+
+```{r Local Linear Trend}
+mod1_ucm <- SSModel(train_ucm ~ SSMtrend(2, 
+                Q = list(matrix(NA),matrix(0))), 
+                H = matrix(NA)) 
+
+
+fit1_ucm <- fitSSM(mod1_ucm,
+                   inits = log(c(v_train_ucm/10,
+                                 v_train_ucm/20,
+                                 v_train_ucm/100))) 
+#fit1_ucm$optim.out$convergence #-- convergence
+
+#-- prevision
+pred1_ucm <- predict(fit1_ucm$model,
+                     n.ahead = length(validation_ucm)) 
+pred1_ucm <- ts(pred1_ucm, start = 585, frequency = 24)
+
+
+plot(validation_ucm, main = "13. LLT previsions on validation", type = "l")
+lines(pred1_ucm, col = "red")
+
+mae1_ucm <- mean(abs(validation_ucm - pred1_ucm))
+#mae1_ucm
+```
+
+LLT with daily stochastic dummy.
+
+Seasonal dummys are used to insert in the model daily seasonality. As seen before it is necessary to model this seasonality which represent a strong component of this TS. With this model a MAE of 0.511847 is obtained.
+Focus of prevision made in first and last week  are shown in plot 14.1 and 14.2. This model capture really well the daily seasonality.
+
+```{r LLT Seasonal Dummy}
+
+mod2_ucm <- SSModel(train_ucm ~ SSMtrend(2, 
+                  Q = list(matrix(NA), matrix(0))) +
+                      SSMseasonal(24, 
+                                  Q = matrix(NA),
+                                  sea.type = 'dummy'),
+                    H = matrix(NA))
+
+fit2_ucm<- fitSSM(mod2_ucm,
+                  inits=log(c(v_train_ucm/10,
+                  v_train_ucm/100,
+                  v_train_ucm/2,
+                  v_train_ucm/50)))
+
+#fit2_ucm$optim.out$convergence #convergencce
+
+#-- previsoin
+pred2_ucm <- predict(fit2_ucm$model,
+                     n.ahead = length(validation_ucm)) 
+pred2_ucm <- ts(pred2_ucm, start = 585, frequency = 24)
+
+
+plot(validation_ucm, main = "14. LLT + daily s. dummy previsions", type = "l")+lines(pred2_ucm, col = "red", )+theme_gray()
+
+#-- focus prima ed ultima settimana
+plot(validation_ucm[1:(24*7)], type = "l", ylim = c(-2, 1), main = "14.1 Prevision LLT+ s. dummy first week", ylab='validation', xlab='time')+lines(pred2_ucm[1:(24*7),], col = "red")
+
+plot(validation_ucm[(3504-24*7):3504], type = "l", ylim = c(-2, 1),main= "14.2 Prevision LLT+ s. dummy last week", ylab='validation', xlab='time')+lines(pred2_ucm[(3504-24*7):3504], col = "red")
+
+
+mae2_ucm <- mean(abs(validation_ucm - pred2_ucm))
+#mae2_ucm
+
+
+```
+
+To be sure to take in account all aspect of forecasting, a cyclic component is added to the prevoius model.
+Considering that a cyclic pattern exists when data exhibit rises and falls that are not of fixed period and that the duration of these fluctuations is usually of at least 2 years. 
+MAE of this model (0.5731635) increase compared to LLT+seasonal dummy model.
+
+```{r LLT + season dummy + cycle (year)}
+mod3_ucm <- SSModel(train_ucm ~ SSMtrend(2, Q = list(matrix(NA), matrix(0))) +
+                      SSMseasonal(24, #-- period
+                                  Q = matrix(NA),
+                                  sea.type = 'dummy') + 
+                      SSMcycle(24*365),
+                    H = matrix(NA))
+
+fit3_ucm<- fitSSM(mod3_ucm,
+                  inits = log(c(v_train_ucm/10,
+                                v_train_ucm/100,
+                                v_train_ucm/2,
+                                v_train_ucm/50)))
+#fit3_ucm$optim.out$convergence #-- raggiunto num max di operazioni
+
+#-- previsioni
+pred3_ucm <- predict(fit3_ucm$model,
+                     n.ahead = length(validation_ucm)) #-- Numerosità Validation (3504)
+pred3_ucm <- ts(pred3_ucm, start = 585, frequency = 24)
+
+
+plot(validation_ucm, main = "15. Prevision LLT+ s.dummy + cycle", type = "l", ylab='validation', xlab='time')
+lines(pred3_ucm, col = "red")
+
+#-- mae
+mae3_ucm <- mean(abs(validation_ucm - pred3_ucm))
+#mae3_ucm
+
+```
+
+Model with trigonometric seasonality is trained but it has no good result in term of MAE on validation set (MAE=0.6601218). 
+
+```{r LLT,trigonometric season}
+mod4_ucm <- SSModel(train_ucm ~ SSMtrend(2,
+                                 Q = list(matrix(NA), matrix(0))) +
+                      SSMseasonal(24, Q = matrix(NA),
+                                  sea.type = "trigonometric"),
+                    H = matrix(NA))
+
+updt4 <- function(pars, model){
+  model$Q[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2])
+  model$Q[3, 3, 1] <- exp(pars[3])
+  model$Q[4, 4, 1] <- exp(pars[4])
+  diag(model$Q[5 : 25, 5 : 25, 1]) <- exp(pars[5])
+  model$H[1, 1, 1] <- exp(pars[6])
+  model
+}
+
+fit4_ucm <- fitSSM(mod4_ucm,
+             log(c(v_train_ucm/10,
+                   v_train_ucm/100,
+                   v_train_ucm/75,
+                   v_train_ucm/20,
+                   v_train_ucm/50,
+                   v_train_ucm/5)),
+             updt4,
+             control = list(maxit = 1000))
+
+#fit4_ucm$optim.out$convergence 
+#-- prevision
+pred4_ucm <- predict(fit4_ucm$model,
+                     n.ahead = length(validation_ucm)) 
+pred3_ucm <- ts(pred4_ucm, start = 585, frequency = 24)
+
+#-- mae 
+mae4_ucm <- mean(abs(validation_ucm - pred4_ucm))
+#mae4_ucm
+
+```
+
+Random Walk is than considered.
+
+As previously seen this TS has a decreasing trend component due (probably) by covid effect on last month of training set (and also on validation).
+Random walk is a substitute to this decreasing trend component. 
+Focus plots for first week show a sovraestimation of values in first part of validation, but in the final part prevision are almost equal to true TS values.
+MAE is 0.4814821.
+
+```{r Random Walk + stag giornaliera + ciclo annuale}
+
+mod5_ucm <- SSModel(train_ucm ~ SSMtrend(1, NA) +
+                      SSMseasonal(24, NA, sea.type = "dummy") +
+                    SSMcycle(24*365),
+                    H = matrix(NA))
+                
+fit5_ucm<- fitSSM(mod5_ucm,
+                  inits = log(c(v_train_ucm/10,
+                                v_train_ucm/100,
+                                v_train_ucm/2,
+                                v_train_ucm/50)))
+
+#fit5_ucm$optim.out$convergence
+
+#-- previsions
+pred5_ucm <- predict(fit5_ucm$model,
+                     n.ahead = length(validation_ucm)) 
+pred5_ucm <- ts(pred5_ucm, start = 585, frequency = 24)
+
+plot(validation_ucm, main = "16. Previsions RW + s. dummy + cycle", type = "l")
+lines(pred5_ucm, col = "red")
+
+#-- focus prima ed ultima settimana
+plot(validation_ucm[1:(24*7)], type = "l", ylim = c(-2, 1),main= "16.1 first week Previsions RW", ylab='validation', xlab='time')
+lines(pred5_ucm[1:(24*7),], col = "red")
+
+plot(validation_ucm[(3504-24*7):3504], type = "l", ylim = c(-2, 1),main= "16.2 last week Previsions RW", ylab='validation', xlab='time')
+lines(pred5_ucm[(3504-24*7):3504], col = "red")
+
+#-- mae
+mae5_ucm <- mean(abs(validation_ucm - pred5_ucm))
+#mae5_ucm
+
+
+
+```
+
+RW model is chosen as best model since its MAE on validation is the lowest of all UCM models trained.
+
+```{r test prevision  with best UCM }
+pred_best_ucm <- SSModel(ts_stand ~ SSMtrend(1, NA) +
+                           SSMseasonal(24, NA, sea.type = "dummy") +
+                           SSMcycle(24*365),
+                         H = matrix(NA))
+
+fit_best_ucm <- fitSSM(pred_best_ucm,
+                  inits = log(c(v_train_ucm/10,
+                                v_train_ucm/100,
+                                v_train_ucm/2,
+                                v_train_ucm/50)))
+
+#fit_best_ucm$optim.out$convergence 
+#-- prevision
+pred_best_ucm <- predict(fit_best_ucm$model,
+                     n.ahead = 1464) 
+pred_best_ucm <- ts(pred_best_ucm, start = 731, frequency = 24)
+
+plot(ts_stand, type = "l", xlim = c(0, 800), main='17. best UCM test prevision ', ylab='scaled TS')
+lines(pred_best_ucm, col = "red")
+
+
+#pred_test_ucm <- unscale(as.numeric(pred_best_ucm), ts_stand)
+#pred_test_ucm <- ts(pred_test_ucm, start = 731, frequency = #24)
+
+```
+
+## ML models
+
+### KNN
+
+Training and validation set for KNN models are created respectively using  80% - 20% of data. 
+Models are trined and evaluated on scaled data. 
+
+
+2 type of KNN model are trained using first a week as
+lenght of TS of which we need to find k  Neighbour, and in the second model using a day.
+
+K parameter for first model (number of closest neighbour) is select in range 1-15, for second model the range is larger 1-20 (since lenght of p is smaller). Parameter tuning for k is made trought a cyclic function.
+Horizon parameter is fixed to validation lenght.
+Multiple-Step Ahead Strategy used is  recursive for both model and the combination function used to aggregate the targets associated with the nearest neighbors is the mean.
+
+```{r training-validation an parameter KNN, echo=TRUE}
+train_knn <- ts_stand[1:as.integer(nrow(ts)*0.8)]
+validation_knn <-ts_stand[(1+as.integer(nrow(ts)*0.8)) : nrow(ts)]
+
+#-- Parameter
+#-- p is the lenght of TS of which we need to find k  Neighbour 
+p <- 1:(24*7)
+p1 <- 1:24
+
+#-- k (Iperparameter k-nn)
+k <- seq(1, 15, 2) 
+k2 <-seq(1, 20, 2) 
+
+#-- horzion of forecasat 
+h <- 3504 
+
+```
+
+For model 1 with P=1 week, optimal number of NN is 9 with a corresponding MAE of 0.4345685.
+
+For model 2 with P=1 day, optimal number of NN is 15 with a corresponding MAE of 0.4223891. 
+
+```{r KNN algorithm}
+for (el in k){
+  mod_knn <- knn_forecasting(timeS = train_knn,
+                       h = h, 
+                       lags = p,
+                       k = el,  
+                       msas = "recursive", 
+                       cf = "mean")
+
+  print(el)
+  pred_knn <- ts(mod_knn$prediction, start = 585, frequency = 24)
+  mae_knn <- mean(abs(validation_knn - pred_knn))
+  print(mae_knn)
+
+}
+
+
+for (el in k2){
+  mod_knn <- knn_forecasting(timeS = train_knn,
+                             h = h, 
+                             lags = p1, 
+                             k = el, 
+                             msas = "recursive",
+                             cf = "mean")           
+  
+  print(el)
+  pred_knn <- ts(mod_knn$prediction, start = 585, frequency = 24)
+  mae_knn <- mean(abs(validation_knn - pred_knn))
+  print(mae_knn)
+  
+} #-- migliore: 15 knn con 0.4345685
+
+
+mod_knn_best <- knn_forecasting(timeS = train_knn,
+                             h = h, 
+                             lags = p1, 
+                             k = 15, 
+                             msas = "recursive",
+                             cf = "mean")           
+  
+pred_knn_best <- ts(mod_knn_best$prediction, start = 585, frequency = 24)
+mae_knn_best <- mean(abs(validation_knn - pred_knn_best))
+#mae_knn_best
+
+prev_knn_best<-ts(pred_knn_best, start=14017)
+autoplot(ts(ts_stand), main='18. KNN prevision on validation', ylab='ts_stand', xlab='time')+
+autolayer(prev_knn_best)
+
+
+
+```
+
+### LSTM
+
+
+Tensor Format:
+
+Predictors (X) must be a 3D Array with dimensions: [samples, timesteps, features]: The first dimension is the length of values, the second is the number of time steps (lags), and the third is the number of predictors (1 if univariate or n if multivariate)
+Outcomes/Targets (y) must be a 2D Array with dimensions: [samples, timesteps]: The first dimension is the length of values and the second is the number of time steps (lags)
+
+Training/Testing dimension: 13652 1168
+
+The training and testing length must be evenly divisible (e.g. training length / testing length must be a whole number)
+
+Batch Size: 73 
+
+The batch size is the number of training examples in one forward/backward pass of a RNN before a weight update
+The batch size must be evenly divisible into both the training an testing lengths (e.g. training length / batch size and testing length / batch size must both be whole numbers)
+
+Time Steps: 24*7
+
+A time step is the number of lags included in the training/testing set
+
+Epochs: 10
+
+The epochs are the total number of forward/backward pass iterations
+Typically more improves model performance unless overfitting occurs at which time the validation accuracy/loss will not improve.
+
+```{r training-validation RNN, echo=TRUE}
+
+datalags   <- 24*7 #-- Orizzonte di ricerca
+batch.size <- 73 #-- prima era 146
+epochs     <- 10
+
+
+train_lstm <- as.data.frame(ts_stand[seq(16352 + datalags)])
+validation_lstm <- as.data.frame(ts_stand[16352 + datalags + seq(1168 + datalags)])
+
+df_val <- ts_stand[(17520-1167) : 17520,] #-- estrarre per mae
+
+colnames(train_lstm) <- c("Valore")
+colnames(validation_lstm) <- c("Valore")
+
+
+x.train <- array(data = lag(train_lstm$Valore, datalags)[ -(1 : datalags)],
+                 dim = c(nrow(train_lstm) - datalags, datalags, 1))
+
+y.train <- array(data = train_lstm$Valore[-(1:datalags)],
+                 dim = c(nrow(train_lstm)-datalags, 1))
+
+x.test <- array(data = lag(validation_lstm$Valore,
+                           datalags)[ -(1 : datalags)],
+                dim = c(nrow(validation_lstm) - datalags, datalags, 1))
+
+y.test <- array(data = validation_lstm$Valore[ -(1 : datalags)],
+                dim = c(nrow(validation_lstm) - datalags, 1))
+
+```
+
+Long Short-Term Memory
+A simple LSTM RNN is trained.
+The model is composed of 2 layer: 
+
+ - lstm layer with 16 neuron units
+ - final dense layer 
+
+This model obtain a MAE of  0.4086391
+Plot of loss show that 10 epochs are sufficient to joint a minimum of 0,1 in loss function. 
+
+```{r LSTM}
+
+model_lstm1 <- keras_model_sequential() #-- Costruzione Strato per Strato
+
+#--- 1. primo modello
+model_lstm1 %>%
+  layer_lstm(units = 16,                  #-- Numero Neuroni 
+             input_shape = c(datalags, 1), #-- Dimensione Input
+             batch_size = batch.size,
+             return_sequences = TRUE,
+             stateful = TRUE) %>%
+  layer_dense(units = 1)                   #-- Layer Denso (Previsione)
+
+model_lstm1 %>%
+  compile(loss = 'mae',       #-- Funzione di Perdita
+          optimizer = 'adam') #-- Ottimizzatore
+
+print(model_lstm1)
+
+#-- Addestramento
+history_lstm1 <- model_lstm1 %>% fit(
+  x = x.train, #-- Train
+  y = y.train, #-- Test
+  epochs = epochs, #-- Epoche di Addestramento
+  batch_size = batch.size,
+  verbose = 1,
+  shuffle = FALSE
+)
+plot(history_lstm1, main='Loss of LSTM1')
+
+pred_out_lstm1 <- model_lstm1 %>%
+  predict(x.test,
+          batch_size = batch.size) %>%
+  .[, 168,1]
+
+mae_lstm1 <- colMeans(drop_na(as.data.frame(abs(df_val - pred_out_lstm1))))
+#mae_lstm1
+
+plot(ts(ts_stand), type= "l")
+lines(c(rep(NA, (16352 + datalags)), pred_out_lstm1),
+      type = "l", lwd = 2, col = "red")
+
+```
+
+Another LSTM model is trained.
+
+This model is composed of two LSTM layer, 2 layer of dropout that randomly sets input units to 0 with a frequency of rate 0.5  at each step during training time, which helps prevent overfitting, and a final dense layer.
+To obtained good results 10 epochs are not sufficient, in fact with 10 epochs loss function is minimized at 0.2.
+MAE for this model is  0.3982217.
+
+```{r LSTM2}
+#-- 2.. modello piï¿½ complesso
+model_lstm2 <- keras_model_sequential() #-- Costruzione Strato per Strato
+
+model_lstm2 %>%
+  layer_lstm(units = 16,                   #-- Numero Neuroni 
+             input_shape = c(datalags, 1), #-- Dimensione Input
+             batch_size = batch.size,
+             return_sequences = TRUE,
+             stateful = TRUE) %>%          #-- Layer di tipo LSTM
+  layer_dropout(rate = 0.5) %>%            #-- Layer di Dropout
+  layer_lstm(units = 8,
+             return_sequences = FALSE,
+             stateful = TRUE) %>%          #-- Layer di tipo LSTM
+  layer_dropout(rate = 0.5) %>%            #-- Layer di Dropout
+  layer_dense(units = 1)                   #-- Layer Denso (Previsione)
+
+model_lstm2 %>%
+  compile(loss = 'mae',         #-- Funzione di Perdita
+          optimizer = 'adam') #-- Ottimizzatore
+
+model_lstm2
+
+history_lstm2 <- model_lstm2 %>% fit(
+  x = x.train, #-- Train
+  y = y.train, #-- Test
+  epochs = epochs, #-- Epoche di Addestramento
+  batch_size = batch.size,
+  verbose = 1,
+  shuffle = FALSE
+)
+plot(history_lstm2, main='Loss of LSTM2')
+
+pred_out_lstm2 <- model_lstm2 %>%
+  predict(x.test,
+          batch_size = batch.size)
+
+
+
+mae_lstm2 <- colMeans(drop_na(as.data.frame(abs(df_val - pred_out_lstm2))))
+#mae_lstm2
+
+
+plot(ts(ts_stand), type= "l")
+lines(c(rep(NA, (16352 + datalags)), pred_out_lstm2),
+      type = "l", lwd = 2, col = "red")
+
+```
+
+ Gated Recurrent Units (GRU) model is trained.
+ MAE for this model on validation set is 0.3938358.
+ More epochs are needed to get better results, since the loss graph show a decreasing trend (and not a stationary situation).
+```{r GRU}
+mod_gru1 <- keras_model_sequential()
+
+mod_gru1 %>%
+  layer_gru(units = 20,
+            input_shape = c(datalags, 1),
+            batch_size  = batch.size,
+            dropout = 0.3,
+            recurrent_dropout = 0.5) %>%
+  layer_dense(units = 1,
+              activation = "linear")
+
+mod_gru1 %>% 
+  compile(loss = 'mae',
+          optimizer = 'adam') #adam
+
+mod_gru1
+
+history_gru1 <- mod_gru1 %>% fit(
+  x = x.train, #-- Train
+  y = y.train, #-- Test
+  epochs = epochs, #-- Epoche di Addestramento
+  batch_size = batch.size,
+  verbose = 1,
+  shuffle = FALSE
+)
+plot(history_gru1, main='Loss of GRU')
+
+pred_out_gru1 <- mod_gru1 %>%
+  predict(x.test,
+          batch_size = batch.size)
+
+mae_gru1 <- colMeans(drop_na(as.data.frame(abs(df_val - pred_out_gru1))))
+mae_gru1
+
+plot(ts(ts_stand), type= "l")
+lines(c(rep(NA, (16352 + datalags)), pred_out_gru1),
+      type = "l", lwd = 2, col = "red")
+
+```
+
+LSTM1 model is chosen to perform prevision on test set. 
+This is consider to be the best model because:
+
+ - it is a simple model which obtain good result in terms of mae on valiadtion (0.40) compared to (0.39) of complex model.
+ 
+ - in term of computational time 10 epochs are sufficient to reach a minimum in loss function, for the other 2 model more epochs are needed.
+ 
+```{r best ml prevision}
+data_to_csv <- read_csv2("C:\\Users\\davol\\Documents\\Magistrale\\time series\\PROJECT\\Previsioni_modelli.csv")
+ts_ml<-ts(data_to_csv$ML, frequency=24, start=730)
+
+autoplot(ts(ts$Valore, frequency = 24), main='Best ML model test prevision')+autolayer(ts_ml)
+```
+
+```{r test prevision with best ML model, eval=FALSE}
+#-- modello migliore: lstm1
+
+train_best_lstm <- as.data.frame(ts_stand[seq(16352 + datalags)])
+
+x.train_best <- array(data = lag(train_lstm$Valore, datalags)
+                      [ -(1 : datalags)],
+                      dim = c(nrow(train_best_lstm)
+                              - datalags, datalags, 1))
+
+y.train_best <- array(data = train_lstm$Valore[-(1:datalags)],
+                      dim = c(nrow(train_best_lstm)-datalags, 1))
+
+
+
+#-- modello
+model_best_ml <- keras_model_sequential() #-- Costruzione Strato per Strato
+
+model_best_ml %>%
+  layer_lstm(units = 16,                  #-- Numero Neuroni 
+             input_shape = c(datalags, 1), #-- Dimensione Input
+             batch_size = batch.size,
+             return_sequences = TRUE,
+             stateful = TRUE) %>%
+  layer_dense(units = 1)                   #-- Layer Denso (Previsione)
+
+model_best_ml %>%
+  compile(loss = 'mae',       #-- Funzione di Perdita
+          optimizer = 'adam') #-- Ottimizzatore
+
+print(model_best_ml)
+
+history_best <- model_best_ml %>% fit(
+  x = x.train_best, #-- Train
+  y = y.train_best, #-- Test
+  epochs = 20, #-- Epoche di Addestramento
+  batch_size = batch.size,
+  verbose = 1,
+  shuffle = FALSE
+)
+plot(history_best)
+
+
+#-- function to predict TEST one step at the time
+pred_list <- c(tail(ts_stand, n = datalags))
+
+for (single_value in c(1: 1464)){
+  single_value <- pred_list[(length(pred_list)-datalags):length(pred_list)]
+  single_value <- array_reshape(single_value, c(1, 1, datalags))
+  single_pred <- model_best_ml %>%
+    predict(single_value)
+  
+  print(single_pred)
+  pred_list <- append(single_pred)
+}  
+
+
+plot(ts(ts_stand), type= "l", xlim = c(0, 18984))
+lines(c(rep(NA, 17520), pred_out_best_ml[,1,1][1:(61*24)]),
+      type = "l", lwd = 2, col = "red")
+```
+ 
+## Conclusion
+
+Best results in term of MAE on validation set are obtained by ML model and Arimax model.
+
+In particular it has been shown that simple arima model and UCM model are affected by the (strong) decreasing trend. In this situation regressors are necessary to model yearly seasonality. 
+UCM models are the worst of all trained model. Probably more complex model should have been trained. 
+Moreover to solve Covid problem a level shift could be added in the models.
+
+
+
+
+```{r scrittura csv, eval=FALSE}
+
+df_date <- c()
+df_hours <- c()
+for (j in c(1:61)){
+  for (i in c(1:24)){
+    
+    date <- as_date("2020-09-01") + j
+    hours <- i
+    
+    df_date <- append(df_date, date)
+    df_hours <- append(df_hours, hours)
+  }
+}
+
+data <- cbind(as.Date(df_date),
+              df_hours,
+              unscale(pred_best_arima$mean, ts_stand),
+              unscale(pred_best_ucm, ts_stand))
+              #unscale(pred_out_best_ml[, 1, 1][1:(61*24)], ts_stand))
+colnames(data) <- c("Data", "Ora", "ARIMA", "UCM")
+
+write_csv2(as.data.frame(data), "calendar.csv")
+
+
+data_to_csv <- read_csv2("Previsioni_modelli.csv")
+
+#plot(ts$Valore, type= "l", xlim = c(0, 20000))
+#lines(c(rep(NA, 17520),
+#            unscale(pred_out_best_ml[, 1, 1][1:(61*24)], ts_stand)),
+#      type = "l", lwd = 2, col = "red")    
+
+```
+
