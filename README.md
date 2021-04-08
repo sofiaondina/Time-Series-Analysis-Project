@@ -2,9 +2,13 @@
 
 The project aims to define, develop and validate a predictive system for time series data.
 Models to implement:
+
 • at least one ARIMA model
+
 • at least one UCM model
+
 • at least one non-linear predictive model (Machine Learning)
+
 The dataset is contained in the “TrainingSet.csv” file.
 
 Target
